@@ -1,0 +1,47 @@
+{
+  "iphone16promax": {
+    "name": "iPhone 16 Pro Max",
+    "platform": "ios",
+    "frame_type": "rgba_transparent",
+    "variants": {
+      "black": {
+        "frame": "iphone16promax/iphone16promax_black.png"
+      }
+    },
+    "screen": {
+      "x": 75,
+      "y": 66,
+      "width": 1320,
+      "height": 2868
+    },
+    "store_target": {
+      "width": 1320,
+      "height": 2868
+    }
+  },
+  "pixel8pro": {
+    "name": "Pixel 8 Pro",
+    "platform": "android",
+    "frame_type": "rgba_with_mask",
+    "variants": {
+      "silver": {
+        "frame": "pixel8pro/frame_silver.png",
+        "mask": "pixel8pro/mask_silver.png"
+      },
+      "black": {
+        "frame": "pixel8pro/frame_black.png",
+        "mask": "pixel8pro/mask_black.png"
+      }
+    },
+    "screen": {
+      "x": 183,
+      "y": 169,
+      "width": 1255,
+      "height": 2792
+    },
+    "store_target": {
+      "width": 1080,
+      "height": 1920
+    }
+  }
+}
