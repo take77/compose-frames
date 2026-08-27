@@ -43,5 +43,22 @@
       "width": 1080,
       "height": 1920
     }
+  },
+  "macbookair13": {
+    "name": "MacBook Air M5 13-inch",
+    "platform": "web",
+    "frame_type": "rgba_transparent",
+    "variants": {
+      "midnight": {
+        "frame": "macbookair13/macbookair13_midnight.png"
+      }
+    },
+    "screen": {
+      "x": 420,
+      "y": 288,
+      "width": 2560,
+      "height": 1664
+    },
+    "fit": "cover"
   }
 }
