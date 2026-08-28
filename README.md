@@ -156,9 +156,11 @@ A laptop bezel is a `web` platform device with `"fit": "cover"` and no `store_ta
 }
 ```
 
-Capture the web screenshot at the screen's own aspect ratio so `cover` crops nothing. For `macbookair13` that screen is 2560x1664, which is **20:13** (≈ 1.538:1) — *not* 16:10 — so capture at a **1600x1040** viewport.
+Capture the web screenshot at the screen's own aspect ratio so `cover` crops nothing. For `macbookair13` that screen is 2560x1664, which is **20:13** (≈ 1.538:1) — *not* 16:10 — so lay the page out at a **1600x1040** viewport.
 
-A 16:10 capture (1600x1000, say) is proportionally taller than the screen, so `cover` scales it to match the screen height and crops roughly 100px off the right edge. Name the file `web_*.png` and run with `--device macbookair13`.
+Capture it at **2x**, though: `cover` scales the file up to the screen rect, so the file itself has to be at least **2560x1664 px** or the result is soft. A 1600x1040 viewport at `deviceScaleFactor: 2` gives a 3200x2080 file, which is comfortably over; a literal 1600x1040 file would be upscaled 1.6x. Name the file `web_*.png` and run with `--device macbookair13`.
+
+A 16:10 capture (1600x1000, say) is proportionally *wider* than the screen — shallower relative to its width — so `cover` scales it to match the screen height and crops roughly 100px off the right edge.
 
 ## Frame sources
 
@@ -171,7 +173,9 @@ Download the bezels from <https://developer.apple.com/design/resources/> — the
 
 Rename the extracted PNG to the filename in the device's `variants` entry and put it in the device's subdirectory of your frame directory.
 
-**Licence:** Apple's design resources may not be redistributed. The Apple bezels are therefore gitignored here (`frames/iphone16promax/*.png`, `frames/macbookair13/*.png`) and never committed to this public repo. Download them yourself, or take them from the shared frames folder described above.
+**Licence:** Apple's design resources may not be redistributed, so the Apple bezels are gitignored here (`frames/iphone16promax/*.png`, `frames/macbookair13/*.png`) and are not part of the tracked tree. Download them yourself, or take them from the shared frames folder described above.
+
+**Still in the history:** `frames/iphone16promax/iphone16promax_black.png` was committed in the initial commit (`6879a69`) and only removed from the tracked tree later. It is therefore still reachable in this public repository's git history, and will stay reachable until the history is rewritten — with `git filter-repo`, or by re-creating the repository from a clean tree. That is deliberately left as the owner's call; until it happens, treat the file as published.
 
 ### Android
 
