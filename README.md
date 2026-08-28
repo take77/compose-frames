@@ -73,6 +73,8 @@ Each device picks up raw screenshots by the filename prefix of its platform:
 | `android` | `and_` | `and_01_list.png`, `and_02_detail.png` |
 | `web` | `web_` | `web_01_export.png`, `web_02_dashboard.png` |
 
+Any other `platform` value is an error.
+
 ## Output files
 
 | Suffix | Content | Use case |
@@ -88,6 +90,8 @@ Each device picks up raw screenshots by the filename prefix of its platform:
 1. Create a subdirectory in the frame directory (e.g. `frames/pixel9pro/`)
 2. Place the frame image (RGBA PNG) and, if needed, a mask image (L-mode PNG) there
 3. Add an entry to `devices.json`:
+
+`devices.json` is validated before anything is rendered, and an invalid entry exits non-zero with a message. Frame and mask files, though, are only required for devices that actually have raw screenshots in the run — so a missing Apple bezel does not break an Android-only run.
 
 ```json
 {
@@ -116,7 +120,9 @@ Each device picks up raw screenshots by the filename prefix of its platform:
 ### frame_type
 
 - `rgba_transparent`: The screen area is alpha=0 in the frame PNG. No mask needed (e.g. Apple official bezels). The screen shape is found by flood-filling the transparent hole from the centre of the image.
-- `rgba_with_mask`: A separate mask PNG defines the screen region (e.g. GitHub community frames for Pixel).
+- `rgba_with_mask`: A separate mask PNG defines the screen region (e.g. GitHub community frames for Pixel). Every variant must name a `mask`, and it must exist and be the same size as its frame.
+
+Any other value is an error. Note that `fit: cover` respects the mask on `rgba_with_mask` frames — without it the screenshot would spill past the mask's rounded corners, because the frame itself is transparent there.
 
 ### fit
 
@@ -127,7 +133,7 @@ Optional, defaults to `width`.
 
 ### store_target
 
-Optional. It is the canvas size of the `*_final.png` background composite. Omit it to use the frame's own size, which is what a marketing image (as opposed to a store submission) usually wants.
+Optional. It is the canvas size of the `*_final.png` background composite. Omit the key entirely to use the frame's own size, which is what a marketing image (as opposed to a store submission) usually wants. If the key is present, `width` and `height` must both be positive integers — an empty or malformed `store_target` is an error rather than a silent fallback.
 
 ### screen
 
@@ -150,7 +156,9 @@ A laptop bezel is a `web` platform device with `"fit": "cover"` and no `store_ta
 }
 ```
 
-Capture the web screenshot at the screen's aspect ratio (16:10 here) so `cover` crops nothing, name it `web_*.png`, and run with `--device macbookair13`.
+Capture the web screenshot at the screen's own aspect ratio so `cover` crops nothing. For `macbookair13` that screen is 2560x1664, which is **20:13** (≈ 1.538:1) — *not* 16:10 — so capture at a **1600x1040** viewport.
+
+A 16:10 capture (1600x1000, say) is proportionally taller than the screen, so `cover` scales it to match the screen height and crops roughly 100px off the right edge. Name the file `web_*.png` and run with `--device macbookair13`.
 
 ## Frame sources
 
