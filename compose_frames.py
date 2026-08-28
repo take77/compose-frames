@@ -63,10 +63,26 @@ def resolve_frame_dir(cli_frame_dir):
     return FALLBACK_FRAME_DIR, 'script default'
 
 
-def load_devices(frame_dir):
+def load_devices(frame_dir, frame_dir_source):
+    """Read devices.json from the frame directory, as an object of device entries.
+
+    A missing, unparsable or wrongly shaped file is a config problem, not a traceback, and
+    the message names where the frame directory came from since that is the usual mistake.
+    """
     devices_json = os.path.join(frame_dir, 'devices.json')
-    with open(devices_json) as f:
-        return json.load(f)
+    try:
+        with open(devices_json) as f:
+            devices = json.load(f)
+    except FileNotFoundError as exc:
+        raise ConfigError(f'devices.json not found: {devices_json} '
+                          f'(frame directory from {frame_dir_source})') from exc
+    except json.JSONDecodeError as exc:
+        raise ConfigError(f'devices.json is not valid JSON ({exc}): {devices_json} '
+                          f'(frame directory from {frame_dir_source})') from exc
+    if not isinstance(devices, dict):
+        raise ConfigError(f'devices.json must hold an object of devices, '
+                          f'got {type(devices).__name__}: {devices_json}')
+    return devices
 
 
 def validate_devices(devices):
@@ -78,6 +94,8 @@ def validate_devices(devices):
     """
     for device_id, device_cfg in devices.items():
         where = f'devices.json: {device_id}'
+        if not isinstance(device_cfg, dict):
+            raise ConfigError(f'{where}: device entry must be an object, got {device_cfg!r}')
 
         platform = device_cfg.get('platform')
         if platform not in RAW_PREFIX_BY_PLATFORM:
@@ -93,15 +111,52 @@ def validate_devices(devices):
         if fit not in SUPPORTED_FITS:
             raise ConfigError(f'{where}: unknown fit {fit!r} (expected one of {SUPPORTED_FITS})')
 
-        for variant_name, variant_cfg in device_cfg.get('variants', {}).items():
-            if not variant_cfg.get('frame'):
-                raise ConfigError(f'{where}, variant {variant_name}: no "frame" file given')
-            if frame_type == 'rgba_with_mask' and not variant_cfg.get('mask'):
-                raise ConfigError(f'{where}, variant {variant_name}: '
-                                  f'frame_type "rgba_with_mask" needs a "mask" file')
+        _validate_variants(device_cfg.get('variants'), frame_type, where)
+        _validate_screen(device_cfg.get('screen'), where)
 
         if 'store_target' in device_cfg:
             _validate_store_target(device_cfg['store_target'], where)
+
+
+def _require_int_at_least(value, minimum, label, where):
+    """Reject the JSON values that would otherwise reach Pillow as a size or a coordinate.
+
+    bool is excluded explicitly: it is a subclass of int, so `true` would pass as 1 and
+    quietly render a one-pixel screen.
+    """
+    if isinstance(value, bool) or not isinstance(value, int) or value < minimum:
+        raise ConfigError(f'{where}: {label} must be an integer >= {minimum}, got {value!r}')
+
+
+def _validate_variants(variants, frame_type, where):
+    """Every device needs at least one variant, and the render path reads its filenames as strings."""
+    if not isinstance(variants, dict) or not variants:
+        raise ConfigError(f'{where}: "variants" must be a non-empty object, got {variants!r}')
+    for variant_name, variant_cfg in variants.items():
+        at = f'{where}, variant {variant_name}'
+        if not isinstance(variant_cfg, dict):
+            raise ConfigError(f'{at}: variant must be an object, got {variant_cfg!r}')
+        frame_file = variant_cfg.get('frame')
+        if not isinstance(frame_file, str) or not frame_file:
+            raise ConfigError(f'{at}: "frame" must be a filename, got {frame_file!r}')
+        if frame_type != 'rgba_with_mask':
+            continue
+        mask_file = variant_cfg.get('mask')
+        if not isinstance(mask_file, str) or not mask_file:
+            raise ConfigError(f'{at}: frame_type "rgba_with_mask" needs a "mask" filename, '
+                              f'got {mask_file!r}')
+
+
+def _validate_screen(screen, where):
+    """The screen rect is dereferenced for every composite, so it has to be there and be usable.
+
+    x and y may be 0, since a screen can start at the very corner of its frame, but a
+    width or height below 1 has no meaning.
+    """
+    if not isinstance(screen, dict):
+        raise ConfigError(f'{where}: "screen" must be an object, got {screen!r}')
+    for key, minimum in (('x', 0), ('y', 0), ('width', 1), ('height', 1)):
+        _require_int_at_least(screen.get(key), minimum, f'screen.{key}', where)
 
 
 def _validate_store_target(store_target, where):
@@ -109,9 +164,7 @@ def _validate_store_target(store_target, where):
     if not isinstance(store_target, dict):
         raise ConfigError(f'{where}: store_target must be an object, got {store_target!r}')
     for key in ('width', 'height'):
-        value = store_target.get(key)
-        if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
-            raise ConfigError(f'{where}: store_target.{key} must be a positive integer, got {value!r}')
+        _require_int_at_least(store_target.get(key), 1, f'store_target.{key}', where)
 
 
 def check_variant_assets(device_id, device_cfg, variant_cfg, frame_dir):
@@ -245,9 +298,10 @@ def compose_with_frame(screenshot_path, output_path, device_cfg, variant_cfg, fr
     if fit == 'cover':
         placed = fit_to_cover_screen(screen, sw, sh)
         if frame_type == 'rgba_with_mask':
-            # Here the mask, not the frame, is what defines the screen shape: the frame is
-            # transparent over the screen, so a cover-fitted screenshot spills past the
-            # mask's rounded corners unless it is clipped to the mask.
+            # Defensive: clip to the mask in case a frame's transparent region reaches
+            # past it. The bundled pixel8pro frames have no fully transparent pixel
+            # outside their mask, but 875 partly transparent ones, which would let a
+            # cover-fitted screenshot show faintly through the rounded corners.
             screen_mask = load_screen_mask(frame, device_cfg, variant_cfg, frame_dir)
             placed.putalpha(screen_mask.crop((sx, sy, sx + sw, sy + sh)))
         # rgba_transparent frames get no mask: the opaque bezel goes on top and already
@@ -346,17 +400,19 @@ def main():
         sys.exit(1)
 
     bg_color = parse_hex_color(args.bg_color)
-    devices = load_devices(frame_dir)
+    print(f'Frames: {frame_dir} (from {frame_dir_source})')
+
+    devices = load_devices(frame_dir, frame_dir_source)
+    if args.device:
+        devices = {device_id: cfg for device_id, cfg in devices.items() if device_id == args.device}
+    # Validate after the --device filter, so an entry for a device this machine's tool does
+    # not know about cannot block a run that was never going to render it.
     validate_devices(devices)
     os.makedirs(out_dir, exist_ok=True)
 
-    print(f'Frames: {frame_dir} (from {frame_dir_source})')
     print('Compositing store screenshots...\n')
 
     for device_id, device_cfg in devices.items():
-        if args.device and args.device != device_id:
-            continue
-
         prefix = RAW_PREFIX_BY_PLATFORM[device_cfg['platform']]
 
         variants = device_cfg['variants']
