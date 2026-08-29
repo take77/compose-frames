@@ -12,20 +12,37 @@ Usage:
   python3 compose_frames.py --raw-dir ./raw --no-background
   python3 compose_frames.py --raw-dir ./raw --bg-color '#FFFFFF'
 
-Device frames are configured in frames/devices.json (relative to this script).
-To add a new device, add its entry there and place frame assets in its subdirectory.
+Frame assets and devices.json are read from the first of these that is set:
+--frame-dir, $COMPOSE_FRAMES_DIR, <script dir>/frames. To add a new device,
+add its entry to devices.json and put its frame assets in a subdirectory of
+that same frame directory.
 """
 
 from PIL import Image, ImageDraw, ImageFilter
 from collections import deque
 import argparse
 import json
+import math
 import os
 import sys
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
-DEFAULT_FRAME_DIR = os.path.join(SCRIPT_DIR, 'frames')
+FALLBACK_FRAME_DIR = os.path.join(SCRIPT_DIR, 'frames')
+FRAME_DIR_ENV_VAR = 'COMPOSE_FRAMES_DIR'
 DEFAULT_BG_COLOR = (244, 243, 238)  # #F4F3EE
+
+# Raw screenshots are picked up by filename prefix, one prefix per platform.
+RAW_PREFIX_BY_PLATFORM = {'ios': 'ios', 'android': 'and', 'web': 'web'}
+
+DEFAULT_FIT = 'width'
+SUPPORTED_FITS = ('width', 'cover')
+
+DEFAULT_FRAME_TYPE = 'rgba_transparent'
+SUPPORTED_FRAME_TYPES = ('rgba_transparent', 'rgba_with_mask')
+
+
+class ConfigError(Exception):
+    """A problem in devices.json, or in the frame assets one of its devices points at."""
 
 
 def parse_hex_color(hex_str):
@@ -33,10 +50,144 @@ def parse_hex_color(hex_str):
     return tuple(int(hex_str[i:i+2], 16) for i in (0, 2, 4))
 
 
-def load_devices(frame_dir):
+def resolve_frame_dir(cli_frame_dir):
+    """Pick the frame directory: --frame-dir wins, then $COMPOSE_FRAMES_DIR, then <script dir>/frames.
+
+    Returns the absolute path and a short label naming which of the three won.
+    """
+    if cli_frame_dir:
+        return os.path.abspath(os.path.expanduser(cli_frame_dir)), '--frame-dir'
+    env_frame_dir = os.environ.get(FRAME_DIR_ENV_VAR)
+    if env_frame_dir:
+        return os.path.abspath(os.path.expanduser(env_frame_dir)), f'${FRAME_DIR_ENV_VAR}'
+    return FALLBACK_FRAME_DIR, 'script default'
+
+
+def load_devices(frame_dir, frame_dir_source):
+    """Read devices.json from the frame directory, as an object of device entries.
+
+    A missing, unparsable or wrongly shaped file is a config problem, not a traceback, and
+    the message names where the frame directory came from since that is the usual mistake.
+    """
     devices_json = os.path.join(frame_dir, 'devices.json')
-    with open(devices_json) as f:
-        return json.load(f)
+    try:
+        with open(devices_json) as f:
+            devices = json.load(f)
+    except FileNotFoundError as exc:
+        raise ConfigError(f'devices.json not found: {devices_json} '
+                          f'(frame directory from {frame_dir_source})') from exc
+    except json.JSONDecodeError as exc:
+        raise ConfigError(f'devices.json is not valid JSON ({exc}): {devices_json} '
+                          f'(frame directory from {frame_dir_source})') from exc
+    if not isinstance(devices, dict):
+        raise ConfigError(f'devices.json must hold an object of devices, '
+                          f'got {type(devices).__name__}: {devices_json}')
+    return devices
+
+
+def validate_devices(devices):
+    """Reject a devices.json the run cannot trust, before any image is opened.
+
+    Only the checks that need nothing but the JSON live here. Whether the frame and mask
+    files are actually on disk is checked per device in check_variant_assets, so a device
+    nobody is rendering never has to have its assets on this machine.
+    """
+    for device_id, device_cfg in devices.items():
+        where = f'devices.json: {device_id}'
+        if not isinstance(device_cfg, dict):
+            raise ConfigError(f'{where}: device entry must be an object, got {device_cfg!r}')
+
+        platform = device_cfg.get('platform')
+        if platform not in RAW_PREFIX_BY_PLATFORM:
+            raise ConfigError(f'{where}: unknown platform {platform!r} '
+                              f'(expected one of {tuple(RAW_PREFIX_BY_PLATFORM)})')
+
+        frame_type = device_cfg.get('frame_type', DEFAULT_FRAME_TYPE)
+        if frame_type not in SUPPORTED_FRAME_TYPES:
+            raise ConfigError(f'{where}: unknown frame_type {frame_type!r} '
+                              f'(expected one of {SUPPORTED_FRAME_TYPES})')
+
+        fit = device_cfg.get('fit', DEFAULT_FIT)
+        if fit not in SUPPORTED_FITS:
+            raise ConfigError(f'{where}: unknown fit {fit!r} (expected one of {SUPPORTED_FITS})')
+
+        _validate_variants(device_cfg.get('variants'), frame_type, where)
+        _validate_screen(device_cfg.get('screen'), where)
+
+        if 'store_target' in device_cfg:
+            _validate_store_target(device_cfg['store_target'], where)
+
+
+def _require_int_at_least(value, minimum, label, where):
+    """Reject the JSON values that would otherwise reach Pillow as a size or a coordinate.
+
+    bool is excluded explicitly: it is a subclass of int, so `true` would pass as 1 and
+    quietly render a one-pixel screen.
+    """
+    if isinstance(value, bool) or not isinstance(value, int) or value < minimum:
+        raise ConfigError(f'{where}: {label} must be an integer >= {minimum}, got {value!r}')
+
+
+def _validate_variants(variants, frame_type, where):
+    """Every device needs at least one variant, and the render path reads its filenames as strings."""
+    if not isinstance(variants, dict) or not variants:
+        raise ConfigError(f'{where}: "variants" must be a non-empty object, got {variants!r}')
+    for variant_name, variant_cfg in variants.items():
+        at = f'{where}, variant {variant_name}'
+        if not isinstance(variant_cfg, dict):
+            raise ConfigError(f'{at}: variant must be an object, got {variant_cfg!r}')
+        frame_file = variant_cfg.get('frame')
+        if not isinstance(frame_file, str) or not frame_file:
+            raise ConfigError(f'{at}: "frame" must be a filename, got {frame_file!r}')
+        if frame_type != 'rgba_with_mask':
+            continue
+        mask_file = variant_cfg.get('mask')
+        if not isinstance(mask_file, str) or not mask_file:
+            raise ConfigError(f'{at}: frame_type "rgba_with_mask" needs a "mask" filename, '
+                              f'got {mask_file!r}')
+
+
+def _validate_screen(screen, where):
+    """The screen rect is dereferenced for every composite, so it has to be there and be usable.
+
+    x and y may be 0, since a screen can start at the very corner of its frame, but a
+    width or height below 1 has no meaning.
+    """
+    if not isinstance(screen, dict):
+        raise ConfigError(f'{where}: "screen" must be an object, got {screen!r}')
+    for key, minimum in (('x', 0), ('y', 0), ('width', 1), ('height', 1)):
+        _require_int_at_least(screen.get(key), minimum, f'screen.{key}', where)
+
+
+def _validate_store_target(store_target, where):
+    """store_target may be left out entirely, but when it is present it has to be usable."""
+    if not isinstance(store_target, dict):
+        raise ConfigError(f'{where}: store_target must be an object, got {store_target!r}')
+    for key in ('width', 'height'):
+        _require_int_at_least(store_target.get(key), 1, f'store_target.{key}', where)
+
+
+def check_variant_assets(device_id, device_cfg, variant_cfg, frame_dir):
+    """Check the variant's frame (and mask) files on disk and return the frame's path.
+
+    Called only once a device is known to have raw screenshots to render, so a frame that
+    is not on this machine breaks only the runs that actually need it.
+    """
+    frame_path = os.path.join(frame_dir, variant_cfg['frame'])
+    if not os.path.isfile(frame_path):
+        raise ConfigError(f'{device_id}: frame image not found: {frame_path}')
+
+    if device_cfg.get('frame_type', DEFAULT_FRAME_TYPE) != 'rgba_with_mask':
+        return frame_path
+
+    mask_path = os.path.join(frame_dir, variant_cfg['mask'])
+    if not os.path.isfile(mask_path):
+        raise ConfigError(f'{device_id}: mask image not found: {mask_path}')
+    with Image.open(frame_path) as frame, Image.open(mask_path) as mask:
+        if frame.size != mask.size:
+            raise ConfigError(f'{device_id}: mask {mask.size} does not match frame {frame.size} '
+                              f'({mask_path})')
+    return frame_path
 
 
 # ─── Screen mask helpers ───────────────────────────────────────
@@ -73,30 +224,30 @@ def _rounded_rect_mask(w, h, radius):
 
 # ─── Generic compositing ──────────────────────────────────────
 
-def compose_with_frame(screenshot_path, output_path, device_cfg, variant_cfg, frame_dir):
-    frame_path = os.path.join(frame_dir, variant_cfg['frame'])
-    frame = Image.open(frame_path).convert('RGBA')
-    screen = Image.open(screenshot_path).convert('RGBA')
+def load_screen_mask(frame, device_cfg, variant_cfg, frame_dir):
+    """Build the screen-shaped mask: the variant's mask PNG for rgba_with_mask, else the frame's transparent hole.
 
-    scr = device_cfg['screen']
-    sx, sy, sw, sh = scr['x'], scr['y'], scr['width'], scr['height']
-
-    frame_type = device_cfg.get('frame_type', 'rgba_transparent')
-
-    if frame_type == 'rgba_with_mask' and 'mask' in variant_cfg:
+    The flood fill walks around an opaque notch, so the hole it finds spans the full
+    screen including the notch band — measuring the centre column instead would put the
+    screen top below the notch. It stops at the opaque bezel and never reaches the
+    transparent margin outside the device.
+    """
+    frame_type = device_cfg.get('frame_type', DEFAULT_FRAME_TYPE)
+    if frame_type == 'rgba_with_mask':
         mask_path = os.path.join(frame_dir, variant_cfg['mask'])
-        screen_mask = Image.open(mask_path).convert('L')
-    elif frame_type == 'rgba_transparent':
-        screen_mask = _flood_fill_mask(
-            frame, (frame.size[0] // 2, frame.size[1] // 2),
-            lambda rgba: rgba[3] == 0,
-        )
-    else:
-        screen_mask = _flood_fill_mask(
-            frame, (frame.size[0] // 2, frame.size[1] // 2),
-            lambda rgba: rgba[3] == 0,
-        )
+        return Image.open(mask_path).convert('L')
+    return _flood_fill_mask(
+        frame, (frame.size[0] // 2, frame.size[1] // 2),
+        lambda rgba: rgba[3] == 0,
+    )
 
+
+def fit_to_screen_width(screen, screen_mask, sx, sy, sw, sh):
+    """Scale the screenshot to the screen width, keep its aspect ratio, and mask it to the screen shape.
+
+    Returns the scaled RGBA layer and the y to paste it at — vertically centred in the
+    screen when the screenshot ends up shorter than the screen.
+    """
     orig_w, orig_h = screen.size
     scale = sw / orig_w
     new_w = sw
@@ -114,9 +265,56 @@ def compose_with_frame(screenshot_path, output_path, device_cfg, variant_cfg, fr
         screen.putalpha(full_mask)
 
     y_offset = max(0, (sh - new_h) // 2)
+    return screen, sy + y_offset
+
+
+def fit_to_cover_screen(screen, sw, sh):
+    """Scale the screenshot until it covers the whole screen rect, then crop it to that rect from the top-left.
+
+    App and web UIs anchor at the top-left, so whatever overflows goes off the right and
+    bottom edges. A screenshot captured at the screen's own aspect ratio loses nothing.
+    """
+    scale = max(sw / screen.width, sh / screen.height)
+    covered = screen.resize(
+        (math.ceil(screen.width * scale), math.ceil(screen.height * scale)),
+        Image.LANCZOS,
+    )
+    return covered.crop((0, 0, sw, sh))
+
+
+def compose_with_frame(screenshot_path, output_path, device_cfg, variant_cfg, frame_dir):
+    frame_path = os.path.join(frame_dir, variant_cfg['frame'])
+    frame = Image.open(frame_path).convert('RGBA')
+    screen = Image.open(screenshot_path).convert('RGBA')
+
+    scr = device_cfg['screen']
+    sx, sy, sw, sh = scr['x'], scr['y'], scr['width'], scr['height']
+
+    frame_type = device_cfg.get('frame_type', DEFAULT_FRAME_TYPE)
+    fit = device_cfg.get('fit', DEFAULT_FIT)
+    if fit not in SUPPORTED_FITS:
+        raise ConfigError(f'{device_cfg["name"]}: unknown fit {fit!r} (expected one of {SUPPORTED_FITS})')
+
+    if fit == 'cover':
+        placed = fit_to_cover_screen(screen, sw, sh)
+        if frame_type == 'rgba_with_mask':
+            # Defensive: clip to the mask in case a frame's transparent region reaches
+            # past it. The bundled pixel8pro frames have no fully transparent pixel
+            # outside their mask, but 875 partly transparent ones, which would let a
+            # cover-fitted screenshot show faintly through the rounded corners.
+            screen_mask = load_screen_mask(frame, device_cfg, variant_cfg, frame_dir)
+            placed.putalpha(screen_mask.crop((sx, sy, sx + sw, sy + sh)))
+        # rgba_transparent frames get no mask: the opaque bezel goes on top and already
+        # clips the screenshot, and masking as well would leave a seam of half-transparent
+        # pixels along the anti-aliased edge of the hole.
+        paste_y = sy
+    else:
+        screen_mask = load_screen_mask(frame, device_cfg, variant_cfg, frame_dir)
+        placed, paste_y = fit_to_screen_width(screen, screen_mask, sx, sy, sw, sh)
 
     canvas = Image.new('RGBA', frame.size, (0, 0, 0, 0))
-    canvas.paste(screen, (sx, sy + y_offset), screen)
+    canvas.paste(placed, (sx, paste_y), placed)
+
     result = Image.alpha_composite(canvas, frame)
 
     result.save(output_path, 'PNG')
@@ -162,11 +360,25 @@ def compose_frameless(screenshot_path, output_path, corner_radius=72):
 
 # ─── Main ───────────────────────────────────────────────────────
 
+def store_target_size(device_cfg, frame_path):
+    """Canvas size for the *_final.png background composite: store_target if set, else the frame's own size.
+
+    Only an absent store_target falls back. A present one has already been validated, so a
+    malformed entry fails loudly instead of quietly rendering at some other size.
+    """
+    target = device_cfg.get('store_target')
+    if target is not None:
+        return target['width'], target['height']
+    with Image.open(frame_path) as frame:
+        return frame.size
+
+
 def main():
     parser = argparse.ArgumentParser(description='Composite screenshots into device frames')
-    parser.add_argument('--raw-dir', required=True, help='Directory containing raw screenshots (ios_*.png, and_*.png)')
+    parser.add_argument('--raw-dir', required=True, help='Directory containing raw screenshots (ios_*.png, and_*.png, web_*.png)')
     parser.add_argument('--out-dir', help='Output directory (default: <raw-dir>/../framed)')
-    parser.add_argument('--frame-dir', default=DEFAULT_FRAME_DIR, help='Directory containing frames/ and devices.json')
+    parser.add_argument('--frame-dir', help=f'Directory containing devices.json and frame assets '
+                                           f'(default: ${FRAME_DIR_ENV_VAR}, else {FALLBACK_FRAME_DIR})')
     parser.add_argument('--device', help='Process only this device (e.g. pixel8pro, iphone16promax)')
     parser.add_argument('--variant', help='Frame color variant (e.g. silver, black)')
     parser.add_argument('--bg-color', default='#F4F3EE', help='Background color hex (default: #F4F3EE)')
@@ -176,26 +388,32 @@ def main():
     args = parser.parse_args()
 
     raw_dir = os.path.abspath(args.raw_dir)
-    frame_dir = os.path.abspath(args.frame_dir)
+    frame_dir, frame_dir_source = resolve_frame_dir(args.frame_dir)
     out_dir = os.path.abspath(args.out_dir) if args.out_dir else os.path.join(os.path.dirname(raw_dir), 'framed')
 
     if not os.path.isdir(raw_dir):
         print(f'Error: raw directory not found: {raw_dir}', file=sys.stderr)
         sys.exit(1)
 
+    if not os.path.isdir(frame_dir):
+        print(f'Error: frame directory not found: {frame_dir} (from {frame_dir_source})', file=sys.stderr)
+        sys.exit(1)
+
     bg_color = parse_hex_color(args.bg_color)
-    devices = load_devices(frame_dir)
+    print(f'Frames: {frame_dir} (from {frame_dir_source})')
+
+    devices = load_devices(frame_dir, frame_dir_source)
+    if args.device:
+        devices = {device_id: cfg for device_id, cfg in devices.items() if device_id == args.device}
+    # Validate after the --device filter, so an entry for a device this machine's tool does
+    # not know about cannot block a run that was never going to render it.
+    validate_devices(devices)
     os.makedirs(out_dir, exist_ok=True)
 
     print('Compositing store screenshots...\n')
 
     for device_id, device_cfg in devices.items():
-        if args.device and args.device != device_id:
-            continue
-
-        platform = device_cfg['platform']
-        prefix = 'ios' if platform == 'ios' else 'and'
-        target = device_cfg['store_target']
+        prefix = RAW_PREFIX_BY_PLATFORM[device_cfg['platform']]
 
         variants = device_cfg['variants']
         if args.variant and args.variant in variants:
@@ -209,9 +427,14 @@ def main():
             if f.startswith(prefix + '_') and f.endswith('.png')
         ])
 
+        # Skip before touching any frame asset: a device with nothing to render must not
+        # require its frame to be on this machine.
         if not raw_files:
             print(f'[{device_cfg["name"]}] No raw screenshots found ({prefix}_*.png)')
             continue
+
+        frame_path = check_variant_assets(device_id, device_cfg, variant_cfg, frame_dir)
+        target_w, target_h = store_target_size(device_cfg, frame_path)
 
         print(f'[{device_cfg["name"]} — {variant_name}]')
 
@@ -224,7 +447,7 @@ def main():
 
             if not args.no_background:
                 final_path = os.path.join(out_dir, f'{name}_final.png')
-                place_on_background(framed_path, final_path, target['width'], target['height'], bg_color)
+                place_on_background(framed_path, final_path, target_w, target_h, bg_color)
 
         if args.frameless:
             print(f'\n[{device_cfg["name"]} — frameless]')
@@ -235,7 +458,7 @@ def main():
                 compose_frameless(raw_path, rounded_path)
                 if not args.no_background:
                     noframe_path = os.path.join(out_dir, f'{name}_noframe.png')
-                    place_on_background(rounded_path, noframe_path, target['width'], target['height'], bg_color)
+                    place_on_background(rounded_path, noframe_path, target_w, target_h, bg_color)
 
         if args.raw_copy:
             print(f'\n[{device_cfg["name"]} — raw copies]')
@@ -253,4 +476,8 @@ def main():
 
 
 if __name__ == '__main__':
-    main()
+    try:
+        main()
+    except ConfigError as exc:
+        print(f'Error: {exc}', file=sys.stderr)
+        sys.exit(1)
